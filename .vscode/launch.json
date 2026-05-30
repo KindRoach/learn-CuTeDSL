@@ -1,0 +1,12 @@
+{
+    "configurations": [
+        {
+            "name": "debug py: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
