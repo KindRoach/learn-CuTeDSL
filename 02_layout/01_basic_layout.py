@@ -14,10 +14,10 @@ def pytorch_tensor_layout():
 
     @cute.jit
     def cute_jit():
-        cute.printf("Tensor layout in CuTe: {}", tensor.layout)
+        layout = cute.make_layout(tensor.shape, stride=tensor.stride)
+        cute.printf("Tensor layout in CuTe: {}", layout)
 
-    cute_jit()
-    visualize_layout(Layout(shape, (shape[1], 1)), file_name="pytorch_tensor_layout")
+    visualize_layout(Layout(tensor.shape, tensor.stride), file_name="pytorch_tensor_layout")
 
 
 def cute_layout():

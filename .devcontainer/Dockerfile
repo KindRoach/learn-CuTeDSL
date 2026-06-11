@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:26.04-py3
+FROM nvcr.io/nvidia/pytorch:26.05-py3
 
 # A cute Layout visualization tool
 RUN pip install tensor-layouts[viz]
