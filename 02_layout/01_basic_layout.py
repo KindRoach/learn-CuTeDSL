@@ -17,6 +17,7 @@ def pytorch_tensor_layout():
         layout = cute.make_layout(tensor.shape, stride=tensor.stride)
         cute.printf("Tensor layout in CuTe: {}", layout)
 
+    cute_jit()
     visualize_layout(Layout(tensor.shape, tensor.stride), file_name="pytorch_tensor_layout")
 
 
