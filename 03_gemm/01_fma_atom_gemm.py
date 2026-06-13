@@ -25,9 +25,10 @@ def fma_gemm_kernel(
     tid, _, _ = cute.arch.thread_idx()
     block_m, block_n, _ = cute.arch.block_idx()
 
-    # A/B Tiles on Gmem
+    # A/B/C Tiles on Gmem
     cta_tile_a = cute.local_tile(mA, cta_tiler_a, (block_m, None))
     cta_tile_b = cute.local_tile(mB, cta_tiler_b, (block_n, None))
+    cta_tile_c = cute.local_tile(mC, cta_tiler_c, (block_m, block_n))
 
     # A/B Tile on Smem
     smem = SmemAllocator()
@@ -35,14 +36,14 @@ def fma_gemm_kernel(
     smem_tile_b = smem.allocate_tensor(mB.element_type, cute.make_layout(cta_tiler_b))
 
     # Accumalator C in registers
-    c_value_layout = cute.get(mma_tv_layout_c, mode=[1])
-    accum_c = cute.make_rmem_tensor_like(c_value_layout, cutlass.Float16)
+    mma_thread_coord = (tid, (None, None))
+    gmem_c_tile = cute.composition(cta_tile_c, mma_tv_layout_c)[mma_thread_coord]
+    accum_c = cute.make_rmem_tensor_like(gmem_c_tile, cutlass.Float16)
     accum_c.fill(0.0)
 
-    mma_thread_coord = (tid, (None, None))
+    # Mainloop over K dimension tiles
     num_k_tiles = cute.size(cta_tile_a, mode=[2])
     for k_tile in cutlass.range(num_k_tiles):
-        # Slice the current CTA's A[M,K] and B[N,K] tiles from global memory.
         k_tile_coord = (None, None, k_tile)
         gmem_tile_a = cta_tile_a[k_tile_coord]
         gmem_tile_b = cta_tile_b[k_tile_coord]
@@ -64,8 +65,6 @@ def fma_gemm_kernel(
         cute.arch.sync_threads()
 
     # Epilogue store
-    cta_tile_c = cute.local_tile(mC, cta_tiler_c, (block_m, block_n))
-    gmem_c_tile = cute.composition(cta_tile_c, mma_tv_layout_c)[mma_thread_coord]
     cute.copy(copy_atom, accum_c, gmem_c_tile)
 
 
