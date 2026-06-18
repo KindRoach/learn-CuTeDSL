@@ -83,8 +83,12 @@ def fma_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # Copy atom for GMEM -> SMEM
     copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float16)
 
-    # A/B tile in 128x32. Each thread owns an 1x32 fragment.
-    cta_tiler_ab, copy_tv_layout_ab = cute.make_layout_tv(
+    # A/B tile in 128x64. Each thread owns an 1x32 fragment.
+    cta_tiler_a, copy_tv_layout_a = cute.make_layout_tv(
+        thr_layout=cute.make_layout((128, 2), stride=(2, 1)),
+        val_layout=cute.make_layout((1, 32), stride=(32, 1)),
+    )
+    cta_tiler_b, copy_tv_layout_b = cute.make_layout_tv(
         thr_layout=cute.make_layout((128, 2), stride=(2, 1)),
         val_layout=cute.make_layout((1, 32), stride=(32, 1)),
     )
@@ -107,7 +111,7 @@ def fma_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
 
     assert mA.shape[0] % cta_tiler_c[0] == 0
     assert mB.shape[0] % cta_tiler_c[1] == 0
-    assert mA.shape[1] % cta_tiler_ab[1] == 0
+    assert mA.shape[1] % cta_tiler_a[1] == 0
 
     grid_m, grid_n = cute.ceil_div(mC.shape, cta_tiler_c)
 
@@ -115,12 +119,12 @@ def fma_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         mA,
         mB,
         mC,
-        cta_tiler_ab,
-        cta_tiler_ab,
+        cta_tiler_a,
+        cta_tiler_b,
         cta_tiler_c,
         copy_atom,
-        copy_tv_layout_ab,
-        copy_tv_layout_ab,
+        copy_tv_layout_a,
+        copy_tv_layout_b,
         mma_atom,
         mma_tv_layout_a,
         mma_tv_layout_b,

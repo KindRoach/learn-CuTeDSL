@@ -14,7 +14,8 @@ def fma_tile_gemm_kernel(
     cta_tiler_a: cute.Shape,
     cta_tiler_b: cute.Shape,
     cta_tiler_c: cute.Shape,
-    tiled_copy_ab: cute.TiledCopy,
+    tiled_copy_a: cute.TiledCopy,
+    tiled_copy_b: cute.TiledCopy,
     tiled_copy_c: cute.TiledCopy,
     tiled_mma: cute.TiledMma,
 ):
@@ -32,13 +33,14 @@ def fma_tile_gemm_kernel(
     smem_tile_b = smem.allocate_tensor(mB.element_type, cute.make_layout(cta_tiler_b))
 
     # Current thread slices for tiled copy and tiled mma
-    thr_copy_ab = tiled_copy_ab.get_slice(tid)
+    thr_copy_a = tiled_copy_a.get_slice(tid)
+    thr_copy_b = tiled_copy_b.get_slice(tid)
     thr_copy_c = tiled_copy_c.get_slice(tid)
     thr_mma = tiled_mma.get_slice(tid)
 
     # Accumalator C in registers
     gmem_c_fragment = thr_mma.partition_C(cta_tile_c)
-    accum_c = cute.make_rmem_tensor_like(gmem_c_fragment, cutlass.Float16)
+    accum_c = tiled_mma.make_fragment_C(gmem_c_fragment)
     accum_c.fill(0.0)
 
     # Mainloop over K dimension tiles
@@ -49,12 +51,12 @@ def fma_tile_gemm_kernel(
         gmem_tile_b = cta_tile_b[k_tile_coord]
 
         # GMEM -> SMEM copy
-        gmem_a_fragment = thr_copy_ab.partition_S(gmem_tile_a)
-        gmem_b_fragment = thr_copy_ab.partition_S(gmem_tile_b)
-        smem_a_fragment = thr_copy_ab.partition_D(smem_tile_a)
-        smem_b_fragment = thr_copy_ab.partition_D(smem_tile_b)
-        cute.copy(tiled_copy_ab, gmem_a_fragment, smem_a_fragment)
-        cute.copy(tiled_copy_ab, gmem_b_fragment, smem_b_fragment)
+        gmem_a_fragment = thr_copy_a.partition_S(gmem_tile_a)
+        gmem_b_fragment = thr_copy_b.partition_S(gmem_tile_b)
+        smem_a_fragment = thr_copy_a.partition_D(smem_tile_a)
+        smem_b_fragment = thr_copy_b.partition_D(smem_tile_b)
+        cute.copy(tiled_copy_a, gmem_a_fragment, smem_a_fragment)
+        cute.copy(tiled_copy_b, gmem_b_fragment, smem_b_fragment)
         cute.arch.sync_threads()
 
         # MMA on the current K tile
@@ -90,10 +92,17 @@ def fma_tile_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
 
     # GMEM -> SMEM copy tile: 256 threads cover a 128x64 tile.
     # Each thread copies one contiguous 1x32 FP16 fragment.
-    tiled_copy_ab = cute.make_tiled_copy_tv(
+    copy_thr_layout = cute.make_layout((128, 2), stride=(2, 1))
+    copy_val_layout = cute.make_layout((1, 32), stride=(32, 1))
+    tiled_copy_a = cute.make_tiled_copy_tv(
         copy_atom,
-        thr_layout=cute.make_layout((128, 2), stride=(2, 1)),
-        val_layout=cute.make_layout((1, 32), stride=(32, 1)),
+        thr_layout=copy_thr_layout,
+        val_layout=copy_val_layout,
+    )
+    tiled_copy_b = cute.make_tiled_copy_tv(
+        copy_atom,
+        thr_layout=copy_thr_layout,
+        val_layout=copy_val_layout,
     )
 
     # CTA-level tiled FMA: 256 threads cover 128x128x64 tile.
@@ -122,7 +131,8 @@ def fma_tile_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         cta_tiler_a,
         cta_tiler_b,
         cta_tiler_c,
-        tiled_copy_ab,
+        tiled_copy_a,
+        tiled_copy_b,
         tiled_copy_c,
         tiled_mma,
     ).launch(
