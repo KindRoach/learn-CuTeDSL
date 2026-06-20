@@ -40,7 +40,7 @@ def fma_tile_gemm_kernel(
 
     # Accumalator C in registers
     gmem_c_fragment = thr_mma.partition_C(cta_tile_c)
-    accum_c = tiled_mma.make_fragment_C(gmem_c_fragment)
+    accum_c = thr_mma.make_fragment_C(gmem_c_fragment)
     accum_c.fill(0.0)
 
     # Mainloop over K dimension tiles
