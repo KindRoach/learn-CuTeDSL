@@ -19,6 +19,7 @@ def make_tiled_copy_for_shape(
     assert tile_elems % threads_per_cta == 0
 
     values_per_thread = tile_elems // threads_per_cta
+    assert threads_per_cta >= rows
     assert values_per_thread % copy_elems == 0
     assert cols % values_per_thread == 0
     chunks_per_row = cols // values_per_thread
@@ -36,12 +37,14 @@ def make_tiled_copy_for_shape(
 
 
 @cute.kernel
-def async_ldmatrix_transpose_staged_kernel(
+def async_ldmatrix_transpose_kernel(
     mA: cute.Tensor,
     mB: cute.Tensor,
     cta_tiler_a: cute.Shape,
     cta_tiler_b: cute.Shape,
     stage_tiler_a: cute.Shape,
+    warp_tiler_a: cute.Shape,
+    warp_tiler_b: cute.Shape,
     smem_layout: Union[cute.Layout, cute.ComposedLayout],
     tiled_copy_g2s: cute.TiledCopy,
     tiled_ldmatrix: cute.TiledCopy,
@@ -52,23 +55,29 @@ def async_ldmatrix_transpose_staged_kernel(
     lane_id = tid % 32
     warp_id = tid // 32
 
+    # Swap block id for transposed tile.
     cta_tile_a = cute.local_tile(mA, cta_tiler_a, (block_m, block_n))
     cta_tile_b = cute.local_tile(mB, cta_tiler_b, (block_n, block_m))
-    cta_tile_a = cute.make_tensor(cta_tile_a.iterator.align(16), cta_tile_a.layout)
 
+    # Smem tensor for one whole CTA tile.
     smem = SmemAllocator()
     smem_tile = smem.allocate_tensor(mA.element_type, smem_layout, byte_alignment=16)
-    smem_ldmatrix_tile = cute.make_tensor(
-        smem_tile.iterator.align(16),
-        smem_tile.layout,
-    )
 
+    # G2S is CTA-wide tile copy, sliced by tid.
     thr_copy_g2s = tiled_copy_g2s.get_slice(tid)
+
+    # Ldmatrix/R2G are warp-wide tile copies, sliced by lane_id.
     thr_ldmatrix = tiled_ldmatrix.get_slice(lane_id)
     thr_copy_r2g = tiled_copy_r2g.get_slice(lane_id)
 
-    # Prime stage 0. Each stage is one 32x64 slab, so every CTA thread issues
-    # one 16B cp.async per stage.
+    # A/B reg tiles use the same physical regs. B is just a logical view of A.
+    reg_tile_a = cute.make_rmem_tensor(warp_tiler_a, mA.element_type)
+    reg_tile_b = cute.make_tensor(
+        reg_tile_a.iterator,
+        cute.make_layout(warp_tiler_b, stride=(warp_tiler_b[1], 1)),
+    )
+
+    # Start stage 0 copy: GMEM -> SMEM.
     gmem_stage_tile = cute.local_tile(cta_tile_a, stage_tiler_a, (0, 0))
     smem_stage_tile = cute.local_tile(smem_tile, stage_tiler_a, (0, 0))
     cute.copy(
@@ -78,11 +87,15 @@ def async_ldmatrix_transpose_staged_kernel(
     )
     cute.arch.cp_async_commit_group()
 
-    for warp_m in cutlass.range(4, unroll_full=True):
+    # Loop over all stages across the CTA tile's M dimension.
+    num_warp_m_tiles = cta_tiler_a[0] // warp_tiler_a[0]
+    for warp_m in cutlass.range(num_warp_m_tiles, unroll_full=True):
+        # Wait for the previously issued copy for this stage.
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        if warp_m < 3:
+        # If not at the last stage, start copying the next stage.
+        if warp_m < num_warp_m_tiles - 1:
             next_warp_m = warp_m + 1
             gmem_next_stage_tile = cute.local_tile(
                 cta_tile_a,
@@ -101,31 +114,23 @@ def async_ldmatrix_transpose_staged_kernel(
             )
             cute.arch.cp_async_commit_group()
 
+        # Ldmatrix copy: SMEM -> REG.
         smem_warp_tile = cute.local_tile(
-            smem_ldmatrix_tile,
-            (32, 8),
+            smem_tile,
+            warp_tiler_a,
             (warp_m, warp_id),
         )
-        smem_warp_tile = cute.make_tensor(
-            smem_warp_tile.iterator.align(16),
-            smem_warp_tile.layout,
-        )
-        gmem_warp_tile_b = cute.local_tile(
-            cta_tile_b,
-            (8, 32),
-            (warp_id, warp_m),
-        )
-
-        reg_tile = cute.make_rmem_tensor((32, 8), mA.element_type)
         cute.copy(
             tiled_ldmatrix,
             thr_ldmatrix.partition_S(smem_warp_tile),
-            thr_ldmatrix.partition_D(reg_tile),
+            thr_ldmatrix.partition_D(reg_tile_a),
         )
 
-        reg_tile_b = cute.make_tensor(
-            reg_tile.iterator,
-            cute.make_layout((8, 32), stride=(32, 1)),
+        # Universal copy: REG -> GMEM.
+        gmem_warp_tile_b = cute.local_tile(
+            cta_tile_b,
+            warp_tiler_b,
+            (warp_id, warp_m),
         )
         cute.copy(
             tiled_copy_r2g,
@@ -134,23 +139,32 @@ def async_ldmatrix_transpose_staged_kernel(
         )
 
 
-@cute.jit
-def async_ldmatrix_transpose_staged(mA: cute.Tensor, mB: cute.Tensor):
-    assert mA.element_type is cutlass.Float16
-    assert mB.element_type is cutlass.Float16
-    assert mA.shape[0] == mB.shape[1]
-    assert mA.shape[1] == mB.shape[0]
-
+def _async_ldmatrix_transpose_impl(mA: cute.Tensor, mB: cute.Tensor, swizzle=None):
     tile_m = 128
     tile_n = 64
     threads_per_cta = 256
     cta_tiler_a = (tile_m, tile_n)
     cta_tiler_b = (tile_n, tile_m)
-    stage_tiler_a = (32, tile_n)
 
+    warp_m = 32
+    warp_n = 8
+    threads_per_warp = 32
+    warp_tiler_a = (warp_m, warp_n)
+    warp_tiler_b = (warp_n, warp_m)
+    stage_tiler_a = (warp_m, tile_n)
+
+    assert mA.element_type is cutlass.Float16
+    assert mB.element_type is cutlass.Float16
+    assert mA.shape[0] == mB.shape[1]
+    assert mA.shape[1] == mB.shape[0]
     assert mA.shape[0] % tile_m == 0
     assert mA.shape[1] % tile_n == 0
+    assert threads_per_cta // threads_per_warp == tile_n // warp_tiler_a[1]
+    assert stage_tiler_a[0] == warp_tiler_a[0]
+    assert stage_tiler_a[1] == cta_tiler_a[1]
 
+    # cp.async copy: GMEM -> SMEM.
+    # CopyG2SOp requires an explicit per-instruction copy width.
     copy_bits = 128
     copy_elems = copy_bits // cutlass.Float16.width
     atom_async_copy = cute.make_copy_atom(
@@ -160,6 +174,9 @@ def async_ldmatrix_transpose_staged(mA: cute.Tensor, mB: cute.Tensor):
         cutlass.Float16,
         num_bits_per_copy=copy_bits,
     )
+
+    # The 128x64 CTA tile is split into four 32x64 stages.
+    # 256 CTA threads each issue exactly one 16B cp.async per stage.
     tiled_copy_g2s = make_tiled_copy_for_shape(
         atom_async_copy,
         stage_tiler_a,
@@ -167,6 +184,11 @@ def async_ldmatrix_transpose_staged(mA: cute.Tensor, mB: cute.Tensor):
         copy_elems,
     )
 
+    # Transposed ldmatrix copy: SMEM -> REG.
+    # One ldmatrix.m8n8.x4.trans reads four stacked 8x8 FP16 matrices,
+    # which combine into a 32x8 A subtile.
+    # Then transposes it into an 8x32 B subtile.
+    # 8 warps distributed along N cover one 32x64 stage tile.
     atom_ldmatrix = cute.make_copy_atom(
         cute.nvgpu.warp.LdMatrix8x8x16bOp(
             transpose=True,
@@ -177,27 +199,44 @@ def async_ldmatrix_transpose_staged(mA: cute.Tensor, mB: cute.Tensor):
     tiled_ldmatrix = cute.make_tiled_copy(
         atom_ldmatrix,
         atom_ldmatrix.layout_src_tv,
-        (32, 8),
+        warp_tiler_a,
     )
 
-    atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float16)
+    # Universal copy: REG -> GMEM.
+    # The 16B vector width helps coalescing but is not required for correctness.
+    # This is a warp-level tiled copy over an 8x32 B subtile.
+    atom_store = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        cutlass.Float16,
+        num_bits_per_copy=copy_bits,
+    )
     tiled_copy_r2g = make_tiled_copy_for_shape(
         atom_store,
-        (8, 32),
-        32,
+        warp_tiler_b,
+        threads_per_warp,
         copy_elems,
     )
 
-    smem_layout = cute.make_layout(cta_tiler_a, stride=(tile_n, 1))
+    # 128x64 row-major SMEM layout. N is contiguous for ldmatrix.x4.
+    # It is split into four 32x64 stage tiles along M.
+    source_layout = cute.make_layout(cta_tiler_a, stride=(tile_n, 1))
 
+    if swizzle is None:
+        smem_layout = source_layout
+    else:
+        smem_layout = cute.make_composed_layout(swizzle, 0, source_layout)
+
+    # Kernel launch.
     grid_m = cute.ceil_div(mA.shape[0], tile_m)
     grid_n = cute.ceil_div(mA.shape[1], tile_n)
-    async_ldmatrix_transpose_staged_kernel(
+    async_ldmatrix_transpose_kernel(
         mA,
         mB,
         cta_tiler_a,
         cta_tiler_b,
         stage_tiler_a,
+        warp_tiler_a,
+        warp_tiler_b,
         smem_layout,
         tiled_copy_g2s,
         tiled_ldmatrix,
@@ -208,22 +247,42 @@ def async_ldmatrix_transpose_staged(mA: cute.Tensor, mB: cute.Tensor):
     )
 
 
-def run_async_ldmatrix_transpose_staged_example():
-    print("run_async_ldmatrix_transpose_staged_example()")
+@cute.jit
+def async_ldmatrix_transpose_no_swizzle(mA: cute.Tensor, mB: cute.Tensor):
+    _async_ldmatrix_transpose_impl(mA, mB)
+
+
+@cute.jit
+def async_ldmatrix_transpose_swizzle(mA: cute.Tensor, mB: cute.Tensor):
+    # Same ldmatrix-friendly swizzle used by 02_ldmatrix_transpose.py.
+    _async_ldmatrix_transpose_impl(mA, mB, cute.make_swizzle(2, 3, 3))
+
+
+def run_async_ldmatrix_transpose_example():
+    print("run_async_ldmatrix_transpose_example()")
     shape = (4096, 4096)
 
     a = torch.randn(shape, device="cuda", dtype=torch.float16)
     expected = a.T.contiguous()
 
-    b_staged = torch.empty_like(expected)
-    async_ldmatrix_transpose_staged(
+    b_no_swizzle = torch.empty_like(expected)
+    async_ldmatrix_transpose_no_swizzle(
         from_dlpack(a, assumed_align=16),
-        from_dlpack(b_staged, assumed_align=16),
+        from_dlpack(b_no_swizzle, assumed_align=16),
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(b_staged, expected)
-    print("passed: staged async cp + ldmatrix B == A.T")
+    torch.testing.assert_close(b_no_swizzle, expected)
+    print("passed: no-swizzle staged async cp + ldmatrix B == A.T")
+
+    b_swizzle = torch.empty_like(expected)
+    async_ldmatrix_transpose_swizzle(
+        from_dlpack(a, assumed_align=16),
+        from_dlpack(b_swizzle, assumed_align=16),
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(b_swizzle, expected)
+    print("passed: swizzle staged async cp + ldmatrix B == A.T")
 
 
 if __name__ == "__main__":
-    run_async_ldmatrix_transpose_staged_example()
+    run_async_ldmatrix_transpose_example()

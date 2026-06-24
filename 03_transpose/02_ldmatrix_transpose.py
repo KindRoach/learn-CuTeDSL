@@ -140,6 +140,7 @@ def _ldmatrix_transpose_impl(mA: cute.Tensor, mB: cute.Tensor, swizzle=None):
     # One ldmatrix.m8n8.x4.trans reads four stacked 8x8 FP16 matrices,
     # which combine into a 32x8 A subtile.
     # Then transposes it into an 8x32 B subtile.
+    # 8 warps distributed along N cover one 32x64 stage tile.
     atom_ldmatrix = cute.make_copy_atom(
         cute.nvgpu.warp.LdMatrix8x8x16bOp(
             transpose=True,
