@@ -8,5 +8,9 @@
         "--gpus=all"
     ],
     "remoteUser": "ubuntu",
-    "updateRemoteUserUID": true
+    "updateRemoteUserUID": true,
+    "initializeCommand": "mkdir -p ${localEnv:HOME}/.vscode-server-devcontainers",
+    "mounts": [
+        "source=${localEnv:HOME}/.vscode-server-devcontainers,target=/home/ubuntu/.vscode-server,type=bind"
+    ]
 }
