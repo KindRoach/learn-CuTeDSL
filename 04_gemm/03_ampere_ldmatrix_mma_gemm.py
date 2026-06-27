@@ -109,14 +109,16 @@ def ldmatrix_mma_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     cta_tiler_b = (cta_n, cta_k)
     cta_tiler_c = (cta_m, cta_n)
 
-    # GMEM -> SMEM Universal copy. 256 threads cover a 128x64 tile.
-    # Each thread copies one contiguous 1x32 FP16 fragment.
+    # GMEM -> SMEM base copy tile: 256 threads cover a 32x64 tile.
+    # Each thread owns one 1x8 FP16 value tile.
+    # TiledCopy partitions the 128x64 CTA tile automatically, cute.copy()
+    # copy tile four times along M, so each thread copies 4x8 FP16 in total.
     universal_copy_atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(),
         cutlass.Float16,
     )
-    copy_thr_layout = cute.make_layout((128, 2), stride=(2, 1))
-    copy_val_layout = cute.make_layout((1, 32), stride=(32, 1))
+    copy_thr_layout = cute.make_layout((32, 8), stride=(8, 1))
+    copy_val_layout = cute.make_layout((1, 8), stride=(8, 1))
     tiled_copy_a = cute.make_tiled_copy_tv(
         universal_copy_atom,
         thr_layout=copy_thr_layout,

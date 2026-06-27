@@ -83,15 +83,16 @@ def fma_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # Copy atom for GMEM -> SMEM
     copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float16)
 
-    # A/B tile in 128x64. Each thread owns an 1x32 fragment.
-    cta_tiler_a, copy_tv_layout_a = cute.make_layout_tv(
-        thr_layout=cute.make_layout((128, 2), stride=(2, 1)),
-        val_layout=cute.make_layout((1, 32), stride=(32, 1)),
-    )
-    cta_tiler_b, copy_tv_layout_b = cute.make_layout_tv(
-        thr_layout=cute.make_layout((128, 2), stride=(2, 1)),
-        val_layout=cute.make_layout((1, 32), stride=(32, 1)),
-    )
+    # The CTA tile is independent from the copy TV layout.
+    cta_tiler_a = (128, 64)
+    cta_tiler_b = (128, 64)
+
+    # Each thread covers 8 contiguous FP16 values (16B). 8 threads cover
+    # a row of 64 FP16 values, so one 32-thread warp covers 4 rows and
+    # 8 warps cover 32 rows. Repeating this pattern 4 times covers 128 rows.
+    # That is a 128x64 CTA tile.
+    copy_tv_layout_a = cute.make_layout(((8, 32), (8, 4)), stride=((1024, 1), (128, 32)))
+    copy_tv_layout_b = cute.make_layout(((8, 32), (8, 4)), stride=((1024, 1), (128, 32)))
 
     # MMA atom via FMA
     mma_atom = cute.make_mma_atom(cute.nvgpu.MmaUniversalOp(cutlass.Float16))
