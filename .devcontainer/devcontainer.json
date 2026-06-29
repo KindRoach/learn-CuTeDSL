@@ -9,8 +9,9 @@
     ],
     "remoteUser": "ubuntu",
     "updateRemoteUserUID": true,
-    "initializeCommand": "mkdir -p ${localEnv:HOME}/.vscode-server-devcontainers",
+    "initializeCommand": "mkdir -p ${localEnv:HOME}/.vscode-server-devcontainers ${localEnv:HOME}/.codex-devcontainers",
     "mounts": [
-        "source=${localEnv:HOME}/.vscode-server-devcontainers,target=/home/ubuntu/.vscode-server,type=bind"
+        "source=${localEnv:HOME}/.vscode-server-devcontainers,target=/home/ubuntu/.vscode-server,type=bind",
+        "source=${localEnv:HOME}/.codex-devcontainers,target=/home/ubuntu/.codex,type=bind"
     ]
 }
