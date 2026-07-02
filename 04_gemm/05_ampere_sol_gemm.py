@@ -7,15 +7,16 @@ from cutlass.utils import SmemAllocator
 
 
 @cute.kernel
-def ampere_cpasync_gemm_kernel(
+def ampere_sol_gemm_kernel(
     mA: cute.Tensor,
     mB: cute.Tensor,
     mC: cute.Tensor,
     cta_tiler_a: cute.Shape,
     cta_tiler_b: cute.Shape,
     cta_tiler_c: cute.Shape,
-    smem_layout_a: cute.Layout,
-    smem_layout_b: cute.Layout,
+    smem_layout_a: cute.ComposedLayout,
+    smem_layout_b: cute.ComposedLayout,
+    smem_layout_c: cute.ComposedLayout,
     tiled_copy_a: cute.TiledCopy,
     tiled_copy_b: cute.TiledCopy,
     tiled_copy_c: cute.TiledCopy,
@@ -24,6 +25,8 @@ def ampere_cpasync_gemm_kernel(
     tiled_mma: cute.TiledMma,
     num_stages: cutlass.Constexpr,
 ):
+    assert num_stages >= 2
+
     tid, _, _ = cute.arch.thread_idx()
     block_m, block_n, _ = cute.arch.block_idx()
 
@@ -32,19 +35,46 @@ def ampere_cpasync_gemm_kernel(
     cta_tile_b = cute.local_tile(mB, cta_tiler_b, (block_n, None))
     cta_tile_c = cute.local_tile(mC, cta_tiler_c, (block_m, block_n))
 
-    # A/B tiles in SMEM
-    smem = SmemAllocator()
-    smem_tile_a = smem.allocate_tensor(mA.element_type, smem_layout_a, byte_alignment=16)
-    smem_tile_b = smem.allocate_tensor(mB.element_type, smem_layout_b, byte_alignment=16)
+    # A/B are dead before the epilogue, so C can alias the same SMEM storage.
+    # cute.struct computes the field sizes, alignments, and tensor views; the
+    # reuse itself comes from interpreting the same allocation as either type.
+    @cute.struct
+    class SharedStorageAB:
+        a: cute.struct.Align[cute.struct.MemRange[mA.element_type, cute.cosize(smem_layout_a)], 16]
+        b: cute.struct.Align[cute.struct.MemRange[mB.element_type, cute.cosize(smem_layout_b)], 16]
 
-    # A/B thread fragments for cp.async copy. The final fragment mode selects
-    # a GMEM K tile on the source and a ring-buffer stage on the destination.
+    @cute.struct
+    class SharedStorageC:
+        c: cute.struct.Align[cute.struct.MemRange[mC.element_type, cute.cosize(smem_layout_c)], 16]
+
+    # Allocate only the larger lifetime region, rather than A/B plus C.
+    smem = SmemAllocator()
+    storage = smem.allocate(
+        max(SharedStorageAB.size_in_bytes(), SharedStorageC.size_in_bytes()),
+        byte_alignment=16,
+    )
+    smem_tile_a = SharedStorageAB(storage).a.get_tensor(smem_layout_a)
+    smem_tile_b = SharedStorageAB(storage).b.get_tensor(smem_layout_b)
+    smem_tile_c = SharedStorageC(storage).c.get_tensor(smem_layout_c)
+
+    # A/B thread fragments for cp.async copy
     thr_copy_a = tiled_copy_a.get_slice(tid)
     thr_copy_b = tiled_copy_b.get_slice(tid)
     gmem_a_copy_fragment = thr_copy_a.partition_S(cta_tile_a)
     gmem_b_copy_fragment = thr_copy_b.partition_S(cta_tile_b)
     smem_a_copy_fragment = thr_copy_a.partition_D(smem_tile_a)
     smem_b_copy_fragment = thr_copy_b.partition_D(smem_tile_b)
+
+    # A/B/C thread fragments for MMA
+    thr_mma = tiled_mma.get_slice(tid)
+    smem_a_mma_fragment = thr_mma.partition_A(smem_tile_a)
+    smem_b_mma_fragment = thr_mma.partition_B(smem_tile_b)
+    smem_c_mma_fragment = thr_mma.partition_C(smem_tile_c)
+    gmem_c_mma_fragment = thr_mma.partition_C(cta_tile_c)
+    reg_a = tiled_mma.make_fragment_A(smem_a_mma_fragment[None, None, None, 0])
+    reg_b = tiled_mma.make_fragment_B(smem_b_mma_fragment[None, None, None, 0])
+    accum_c = tiled_mma.make_fragment_C(gmem_c_mma_fragment)
+    accum_c.fill(0.0)
 
     # A/B thread fragments for ldmatrix copy
     thr_ldmatrix_a = tiled_ldmatrix_a.get_slice(tid)
@@ -53,16 +83,6 @@ def ampere_cpasync_gemm_kernel(
     smem_b_ldmatrix_fragment = thr_ldmatrix_b.partition_S(smem_tile_b)
     reg_a_ldmatrix_fragment = thr_ldmatrix_a.retile(reg_a)
     reg_b_ldmatrix_fragment = thr_ldmatrix_b.retile(reg_b)
-
-    # A/B/C thread fragments for MMA
-    thr_mma = tiled_mma.get_slice(tid)
-    smem_a_mma_fragment = thr_mma.partition_A(smem_tile_a)
-    smem_b_mma_fragment = thr_mma.partition_B(smem_tile_b)
-    gmem_c_mma_fragment = thr_mma.partition_C(cta_tile_c)
-    reg_a = tiled_mma.make_fragment_A(smem_a_mma_fragment[None, None, None, 0])
-    reg_b = tiled_mma.make_fragment_B(smem_b_mma_fragment[None, None, None, 0])
-    accum_c = tiled_mma.make_fragment_C(gmem_c_mma_fragment)
-    accum_c.fill(0.0)
 
     # Prologue: prefetch num_stages - 1 K tiles.
     for stage in range(num_stages - 1):
@@ -78,12 +98,12 @@ def ampere_cpasync_gemm_kernel(
         )
         cute.arch.cp_async_commit_group()
 
-    # Initialize the multi-stage MMA pipeline state.
+    # init states for multi stage mma pipeline
     smem_pipe_read = 0
     smem_pipe_write = num_stages - 1
     next_k_tile = num_stages - 1
 
-    # Mainloop
+    # Mainloops
     num_k_tiles = cute.size(cta_tile_a, mode=[2])
     for _ in cutlass.range(num_k_tiles):
         # Wait until the current read stage is ready.
@@ -140,16 +160,88 @@ def ampere_cpasync_gemm_kernel(
     result_c = cute.make_fragment_like(accum_c, mC.element_type)
     result_c[None] = accum_c.load().to(mC.element_type)
 
-    # Retile the MMA-owned register fragment to the C-copy ownership, then
-    # perform the coalesced REG -> GMEM store.
+    # store the MMA-owned register C fragment into smem.
+    cute.autovec_copy(result_c, smem_c_mma_fragment)
+    cute.arch.sync_threads()
+
+    # copy the smem C tile into gmem via vectorized store.
     thr_copy_c = tiled_copy_c.get_slice(tid)
-    store_c_fragment = thr_copy_c.partition_D(cta_tile_c)
-    store_result_c = tiled_copy_c.retile(result_c)
-    cute.copy(tiled_copy_c, store_result_c, store_c_fragment)
+    smem_c_store_fragment = thr_copy_c.partition_S(smem_tile_c)
+    gmem_c_store_fragment = thr_copy_c.partition_D(cta_tile_c)
+    cute.copy(tiled_copy_c, smem_c_store_fragment, gmem_c_store_fragment)
+
+
+def make_smem_layout(smem_shape, swizzle):
+    """Tile a swizzled, contiguous-major atom to an SMEM shape."""
+    # Step 1: Build the smallest atom containing every swizzle state.
+    # A B-bit XOR mask has 2**B states, so its row pattern repeats after
+    # 2**B rows. The atom's second mode remains fully contiguous.
+    swizzle_rows = 1 << swizzle.num_bits
+    major_mode_size = smem_shape[1]
+    layout_atom_outer = cute.make_layout(
+        (swizzle_rows, major_mode_size),
+        stride=(major_mode_size, 1),
+    )
+
+    # Step 2: Compose the logical atom with the requested swizzle.
+    layout_atom = cute.make_composed_layout(
+        swizzle,
+        0,
+        layout_atom_outer,
+    )
+
+    # Step 3: Repeat the swizzled atom to cover the complete SMEM shape.
+    # Natural mode order keeps earlier modes tighter and the stage mode outermost.
+    return cute.tile_to_shape(
+        layout_atom,
+        smem_shape,
+        tuple(range(len(smem_shape))),
+    )
+
+
+def make_vectorized_tiled_copy(copy_atom, threads_per_cta, tile_shape, copy_elems):
+    """Build a vectorized TiledCopy for a rectangular 2-D tile.
+
+    Threads are arranged along the contiguous second mode first. Each thread
+    copies ``copy_elems`` adjacent values, and the remaining thread dimension
+    covers the first mode. CuTe repeats this pattern along the first mode when
+    it is smaller than the full tile.
+    """
+    tile_outer, tile_contiguous = tile_shape
+
+    # One thread owns one vector, so covering a complete row requires one
+    # thread for every copy_elems values along the contiguous second mode.
+    assert tile_contiguous % copy_elems == 0
+    threads_contiguous = tile_contiguous // copy_elems
+
+    # Put all remaining threads along the first mode. Require the resulting
+    # thread tile to divide the full tile exactly so it has no residue.
+    assert threads_per_cta % threads_contiguous == 0
+    threads_outer = threads_per_cta // threads_contiguous
+    assert tile_outer % threads_outer == 0
+
+    # Map consecutive thread IDs along the contiguous mode, then the outer
+    # mode. Together with value_layout, this covers
+    # (threads_outer, tile_contiguous) elements per thread/value tile.
+    thread_layout = cute.make_layout(
+        (threads_outer, threads_contiguous),
+        stride=(threads_contiguous, 1),
+    )
+
+    # Each thread copies one vector along the contiguous second mode.
+    value_layout = cute.make_layout((1, copy_elems), stride=(copy_elems, 1))
+
+    # Partitioning the full tensor repeats this thread/value tile
+    # tile_outer / threads_outer times along the first mode.
+    return cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
 
 
 @cute.jit
-def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+def ampere_sol_gemm(
+    mA: cute.Tensor,
+    mB: cute.Tensor,
+    mC: cute.Tensor,
+):
     assert mA.element_type is cutlass.Float16
     assert mB.element_type is cutlass.Float16
     assert mC.element_type is cutlass.Float16
@@ -174,27 +266,28 @@ def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # the resulting 4 repetitions along the first mode. Each thread loads
     # 4x8 FP16 values in total.
     copy_bits = 128
+    copy_elems = copy_bits // cutlass.Float16.width
     async_copy_atom = cute.make_copy_atom(
         cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
         cutlass.Float16,
         num_bits_per_copy=copy_bits,
     )
-    copy_thr_layout = cute.make_layout((32, 8), stride=(8, 1))
-    copy_val_layout = cute.make_layout((1, 8), stride=(8, 1))
-    tiled_copy_a = cute.make_tiled_copy_tv(
+    tiled_copy_a = make_vectorized_tiled_copy(
         async_copy_atom,
-        thr_layout=copy_thr_layout,
-        val_layout=copy_val_layout,
+        threads_per_cta,
+        cta_tiler_a,
+        copy_elems,
     )
-    tiled_copy_b = cute.make_tiled_copy_tv(
+    tiled_copy_b = make_vectorized_tiled_copy(
         async_copy_atom,
-        thr_layout=copy_thr_layout,
-        val_layout=copy_val_layout,
+        threads_per_cta,
+        cta_tiler_b,
+        copy_elems,
     )
 
     # SMEM -> REG ldmatrix copy
     # One ldmatrix.m8n8.x4 reads four 8x8 FP16 matrices: an 8x32 tile.
-    # A 16x2 grid of ldmatrix.m8n8.x4 covers a 128x64 A/B tile.
+    # A 16x2 grid of ldmatrix.m8n8.x4 cover 128x64 A/B tile.
     ldmatrix_copy_atom = cute.make_copy_atom(
         cute.nvgpu.warp.LdMatrix8x8x16bOp(
             transpose=False,
@@ -203,11 +296,24 @@ def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         cutlass.Float16,
     )
 
-    # The SMEM layout is a ring buffer of num_stages contiguous 128x64 tiles.
-    # K remains contiguous for ldmatrix.x4, and the final mode selects the
-    # pipeline stage.
-    smem_layout_a = cute.make_layout((cta_m, cta_k, num_stages), stride=(cta_k, 1, cta_m * cta_k))
-    smem_layout_b = cute.make_layout((cta_n, cta_k, num_stages), stride=(cta_k, 1, cta_n * cta_k))
+    # Multi contiguous 128x64 ring-buffer stages. K remains contiguous for
+    # ldmatrix.x4 while the final mode selects the pipeline stage.
+    # The final mode adds num_stages copies of the 128x64 CTA tile in SMEM.
+    smem_layout_a = make_smem_layout(
+        (cta_m, cta_k, num_stages),
+        cute.make_swizzle(3, 3, 3),
+    )
+    smem_layout_b = make_smem_layout(
+        (cta_n, cta_k, num_stages),
+        cute.make_swizzle(3, 3, 3),
+    )
+
+    # the C tile use smem as middle buffer for vectorized store
+    # only one stage is needed for a CTA
+    smem_layout_c = make_smem_layout(
+        (cta_m, cta_n),
+        cute.make_swizzle(3, 3, 4),
+    )
 
     # One warp-level mma.m16n8k16 covers 16x8x16.
     # The 8 CTA warps are arranged as (4,2,1) MMA atoms.
@@ -224,17 +330,26 @@ def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         permutation_mnk=(cta_m, cta_n, cta_k),
     )
 
-    # Derive A/B ldmatrix TiledCopies matching the tiled MMA register layouts.
+    # CuTe DSL auto match register from ldmatrix to tiled_mma
     tiled_ldmatrix_a = cute.make_tiled_copy_A(ldmatrix_copy_atom, tiled_mma)
     tiled_ldmatrix_b = cute.make_tiled_copy_B(ldmatrix_copy_atom, tiled_mma)
 
-    # Epilogue REG -> GMEM copy follows the MMA C ownership. CuTe derives a
-    # matching TiledCopy, so retile() changes only the register-fragment view.
-    universal_copy_atom = cute.make_copy_atom(
+    # Epilogue SMEM -> GMEM logical copy: 256 threads cover a 128x128 C tile.
+    # Each thread owns one contiguous 1x8 FP16 value tile per repetition.
+    # 16 threads cover one 1x128 row, so 256 threads cover a 16x128 tile.
+    # TiledCopy partitions the full 128x128 CTA tile, and cute.copy() executes
+    # the resulting 8 repetitions along M. Each thread stores 8x8 FP16 total.
+    vector_copy_atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(),
         cutlass.Float16,
+        num_bits_per_copy=copy_bits,
     )
-    tiled_copy_c = cute.make_tiled_copy_C(universal_copy_atom, tiled_mma)
+    tiled_copy_c = make_vectorized_tiled_copy(
+        vector_copy_atom,
+        threads_per_cta,
+        cta_tiler_c,
+        copy_elems,
+    )
 
     assert mA.shape[0] % cta_tiler_c[0] == 0
     assert mB.shape[0] % cta_tiler_c[1] == 0
@@ -242,8 +357,7 @@ def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     assert mA.shape[1] >= (num_stages - 1) * cta_k
 
     grid_m, grid_n = cute.ceil_div(mC.shape, cta_tiler_c)
-
-    ampere_cpasync_gemm_kernel(
+    ampere_sol_gemm_kernel(
         mA,
         mB,
         mC,
@@ -252,6 +366,7 @@ def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         cta_tiler_c,
         smem_layout_a,
         smem_layout_b,
+        smem_layout_c,
         tiled_copy_a,
         tiled_copy_b,
         tiled_copy_c,
@@ -265,16 +380,15 @@ def ampere_cpasync_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     )
 
 
-def run_ampere_cpasync_gemm_example():
-    print("run_ampere_cpasync_gemm_example()")
+def run_ampere_sol_gemm_example():
+    print("run_ampere_sol_gemm_example()")
 
-    # No-bounds path: M/N/K must be divisible by the 128x128x64 CTA tile.
     m, n, k = 4096, 2048, 1024
     a = torch.randn((m, k), device="cuda", dtype=torch.float16)
     b = torch.randn((n, k), device="cuda", dtype=torch.float16)
     c = torch.empty((m, n), device="cuda", dtype=torch.float16)
 
-    ampere_cpasync_gemm(
+    ampere_sol_gemm(
         from_dlpack(a, assumed_align=16),
         from_dlpack(b, assumed_align=16),
         from_dlpack(c, assumed_align=16),
@@ -288,4 +402,4 @@ def run_ampere_cpasync_gemm_example():
 
 
 if __name__ == "__main__":
-    run_ampere_cpasync_gemm_example()
+    run_ampere_sol_gemm_example()
